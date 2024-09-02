@@ -10,36 +10,10 @@ import tempfile
 import cutlass
 from cutlass.epilogue import relu
 from cutlass import Tensor as FakeTensor
-from cutlass.utils.profiler import CUDAEventProfiler
+from cutlass.utils.profiler import GpuTimer
 
 from cutlass.backend import compiler
 from cutlass.backend.library import TensorDescription, TileDescription
-
-kernel_name = "gemm_add_bias"
-
-# GEMM Problem Size
-L = 1
-M = 1024
-N = 1024
-K = 1024
-
-# Data Types
-type_A = torch.float16
-type_B = torch.float16
-type_C = torch.float16
-type_D = torch.float16
-
-type_accumulator = torch.float32
-
-layout_A = cutlass.LayoutType.RowMajor
-layout_B = cutlass.LayoutType.RowMajor
-layout_C = cutlass.LayoutType.RowMajor
-layout_D = cutlass.LayoutType.RowMajor
-
-shape_A = (L, M, K)
-shape_B = (L, K, N)
-shape_C = (L, M, N)
-shape_D = (L, M, N)
 
 
 class TensorInfo:
@@ -51,45 +25,6 @@ class TensorInfo:
 
     def __repr__(self):
         return f"TensorInfo(name={self.name}, shape={self.shape}, dtype={self.dtype}, layout={self.layout})"
-
-
-input_tensor = [
-    TensorInfo("A", shape_A, type_A, layout_A),
-    TensorInfo("B", shape_B, type_B, layout_B),
-    TensorInfo("C", shape_C, type_C, layout_C),
-]
-
-output_tensor = [
-    TensorInfo("D", shape_D, type_D, layout_D),
-]
-
-plan = cutlass.op.Gemm(
-    element=type_D, layout=layout_D, element_accumulator=type_accumulator
-)
-
-
-# Define epilogue visitor
-def example_epilogue(accum, C):
-    D = accum * 0.2 + C * 0.8
-    return D
-
-
-# define example tensors
-example_tensors = {
-    "accum": FakeTensor(
-        element=torch.float32, shape=(M, N), layout_tag=cutlass.LayoutType.RowMajor
-    ),
-    "C": FakeTensor(
-        element=type_C, shape=(M, N), layout_tag=cutlass.LayoutType.RowMajor
-    ),
-    "D": FakeTensor(
-        element=type_D, shape=(M, N), layout_tag=cutlass.LayoutType.RowMajor
-    ),
-}
-
-# Trace the epilogue visitor
-epilogue_visitor = cutlass.epilogue.trace(example_epilogue, example_tensors)
-plan.epilogue_visitor = epilogue_visitor
 
 
 def SubstituteTemplate(template, values):
@@ -148,12 +83,44 @@ class CutlassEvtEmitter:
     def __init__(
         self,
         gemm_plan: cutlass.op.Gemm,
+        kernel_name: str,
         input_tensor: List[TensorInfo],
         output_tensor: List[TensorInfo],
     ):
         self.gemm_plan = gemm_plan
+        self.kernel_name = kernel_name
         self.input_tensor = input_tensor
         self.output_tensor = output_tensor
+        self._init_gemm_default_tensors()
+
+    def _init_gemm_default_tensors(self):
+        for out_tensor in self.output_tensor:
+            if out_tensor.name == "D":
+                self.D = out_tensor
+                self.M = out_tensor.shape[-2]
+                self.N = out_tensor.shape[-1]
+                if len(out_tensor.shape) == 3:
+                    self.L = out_tensor.shape[0]
+                else:
+                    self.L = 1
+
+        for input_tensor in self.input_tensor:
+            if input_tensor.name == "A":
+                self.A = input_tensor
+                if self.A.layout == cutlass.LayoutType.RowMajor:
+                    self.K = input_tensor.shape[-1]
+                else:
+                    self.K = input_tensor.shape[-2]
+                self.shape_A = input_tensor.shape
+
+            if input_tensor.name == "B":
+                self.B = input_tensor
+                if self.B.layout == cutlass.LayoutType.RowMajor:
+                    K = input_tensor.shape[-2]
+                else:
+                    K = input_tensor.shape[-1]
+                assert K == self.K
+                self.shape_B = input_tensor.shape
 
     def is_imm_structure(self, cls):
         if not hasattr(cls, "_fields_"):
@@ -282,7 +249,7 @@ class CutlassEvtEmitter:
         return "\n".join([f'#include "{include}"' for include in include_list])
 
     def emit_evt_argument_type(self):
-        epilogue_type = plan.epilogue_visitor.epilogue_type
+        epilogue_type = self.gemm_plan.epilogue_visitor.epilogue_type
         assert len(epilogue_type._fields_) == 1
         assert epilogue_type._fields_[0][0] == "output_op"
         # print(self.ctypes_to_cpp_constructor(epilogue_type._fields_[0][1]))
@@ -298,7 +265,9 @@ static int L = ${L};
 cutlass::gemm::GemmCoord problem_size(M, N, K);
         """
 
-        return SubstituteTemplate(template, {"M": M, "N": N, "K": K, "L": L})
+        return SubstituteTemplate(
+            template, {"M": self.M, "N": self.N, "K": self.K, "L": self.L}
+        )
 
     def emit_type_and_layout(self):
         template_type = "using Element${tensor_name} = ${tensor_type};\n"
@@ -379,16 +348,16 @@ cutlass::gemm::GemmCoord problem_size(M, N, K);
             + ";"
         )
 
-        batch_stride_A = shape_A[-1] * shape_A[-2]
-        batch_stride_B = shape_B[-1] * shape_B[-2]
+        batch_stride_A = self.shape_A[-1] * self.shape_A[-2]
+        batch_stride_B = self.shape_B[-1] * self.shape_B[-2]
 
-        stride_A = shape_A[-1]
-        stride_B = shape_B[-1]
+        stride_A = self.shape_A[-1]
+        stride_B = self.shape_B[-1]
 
         gemm_arguments = SubstituteTemplate(
             gemm_arguments_template,
             {
-                "L": L,
+                "L": self.L,
                 "batch_stride_A": batch_stride_A,
                 "batch_stride_B": batch_stride_B,
                 "stride_A": stride_A,
@@ -441,7 +410,7 @@ extern "C" void ${kernel_name}(${func_params}) {
         func = SubstituteTemplate(
             func_template,
             {
-                "kernel_name": kernel_name,
+                "kernel_name": self.kernel_name,
                 "func_params": ", ".join(func_params),
                 "EVT_D_callbacks": EVT_D_callbacks,
                 "arguemnts": gemm_arguments,
@@ -459,10 +428,6 @@ extern "C" void ${kernel_name}(${func_params}) {
         code += self.emit_type_and_layout()
         code += self.emit_cutlass_entry_function()
         return code
-
-
-# print(cutlass_evt_emitter.emit())
-# cutlass_evt_emitter._get_evt_argument_type()
 
 
 class Compiler:
@@ -494,25 +459,104 @@ class Compiler:
     def compile(self):
         # use Temporary directory to store the generated cu file
         tempfile.tempdir = "./"
-        temp_cu = tempfile.NamedTemporaryFile(
-            prefix="kernel", suffix=".cu", delete=False
-        )
+        # temp_cu = tempfile.NamedTemporaryFile(
+        #     prefix="kernel", suffix=".cu", delete=False
+        # )
+        # delete .so
+        cu_name = self.shared_lib_name[:-3] + ".cu"
 
-        with open(temp_cu.name, "w") as f:
+        with open(cu_name, "w") as f:
             f.write(self.cutlass_code)
 
         cmd = SubstituteTemplate(
             self.cmd_template,
-            {"shared_lib_name": self.shared_lib_name, "cu_name": temp_cu.name},
+            {"shared_lib_name": self.shared_lib_name, "cu_name": cu_name},
         )
         # print(cmd)
         cmd = cmd.split(" ")
 
         error_file = "error.log"
-        self.compile_with_nvcc(cmd, temp_cu.name, error_file)
+        self.compile_with_nvcc(cmd, cu_name, error_file)
 
 
-cutlass_evt_emitter = CutlassEvtEmitter(plan, input_tensor, output_tensor)
-code = cutlass_evt_emitter.emit()
-compiler = Compiler(code, "cutlass_evt.so")
-compiler.compile()
+def emit_cutlass_evt_kernel(
+    gemm_plan: cutlass.op.Gemm,
+    kernel_name: str,
+    input_tensor: List[TensorInfo],
+    output_tensor: List[TensorInfo],
+    shared_lib_name: str,
+):
+    emitter = CutlassEvtEmitter(gemm_plan, kernel_name, input_tensor, output_tensor)
+    cutlass_code = emitter.emit()
+    compiler = Compiler(cutlass_code, shared_lib_name)
+    compiler.compile()
+
+
+def dtype_to_torch(dtype):
+    if dtype == "f16":
+        return torch.float16
+    elif dtype == "f32":
+        return torch.float32
+    elif dtype == "bf16":
+        return torch.bfloat16
+    else:
+        raise ValueError("Unsupported data type")
+
+
+def run_kernel(input_tensors, output_tensors, kernel_name, so_name):
+    cutlass_lib = ctypes.CDLL("./" + so_name)
+    # find func kernel_name
+    cutlass_kernel = getattr(cutlass_lib, kernel_name)
+    cutlass_kernel.argtypes = [ctypes.c_void_p] * len(
+        input_tensors + output_tensors
+    ) + [
+        ctypes.c_void_p
+    ]  # stream
+    cutlass_kernel.restype = None
+
+    all_torch_tensors = []
+    # prepare data
+    for tensor in input_tensors + output_tensors:
+        all_torch_tensors.append(
+            torch.randn(tensor.shape, dtype=tensor.dtype, device="cuda").uniform_(-1, 1)
+        )
+
+    # call kernel
+    cutlass_kernel(
+        *[tensor.data_ptr() for tensor in all_torch_tensors] + [ctypes.c_void_p(0)]
+    )
+
+def profile_kernel(input_tensors, output_tensors, kernel_name, so_name, num_iter=10):
+    cutlass_lib = ctypes.CDLL("./" + so_name)
+    # find func kernel_name
+    cutlass_kernel = getattr(cutlass_lib, kernel_name)
+    cutlass_kernel.argtypes = [ctypes.c_void_p] * len(
+        input_tensors + output_tensors
+    ) + [
+        ctypes.c_void_p
+    ]  # stream
+    cutlass_kernel.restype = None
+
+    all_torch_tensors = []
+    # prepare data
+    for tensor in input_tensors + output_tensors:
+        all_torch_tensors.append(
+            torch.randn(tensor.shape, dtype=tensor.dtype, device="cuda").uniform_(-1, 1)
+        )
+
+    # warm up
+    for _ in range(10):
+        cutlass_kernel(
+            *[tensor.data_ptr() for tensor in all_torch_tensors] + [ctypes.c_void_p(0)]
+        )
+    torch.cuda.synchronize()
+    # run and return the average time
+    timer = GpuTimer()
+    timer.start()
+    for _ in range(num_iter):
+        cutlass_kernel(
+            *[tensor.data_ptr() for tensor in all_torch_tensors] + [ctypes.c_void_p(0)]
+        )
+    timer.stop_and_wait()
+    return timer.duration(num_iter)
+    
