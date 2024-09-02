@@ -16,7 +16,7 @@ if __name__ == "__main__":
     # parse M, N, K, and data type
 
     parser = argparse.ArgumentParser(
-        description="Generate CUTLASS EVT kernel for GEMM with bias addition"
+        description="Generate biasUTLASS EVT kernel for GEMM with bias addition"
     )
     parser.add_argument("--L", type=int, default=1, help="Number of GEMM operations")
     parser.add_argument("--M", type=int, default=128, help="M dimension of GEMM")
@@ -42,14 +42,14 @@ if __name__ == "__main__":
     layout_type = cutlass.LayoutType.RowMajor
     A_TensorInfo = TensorInfo("A", (L, M, K), type_input, layout_type)
     B_TensorInfo = TensorInfo("B", (L, K, N), type_input, layout_type)
-    C_TensorInfo = TensorInfo("C", (L, M, N), type_input, layout_type)
+    bias_TensorInfo = TensorInfo("bias", (N,), type_input, layout_type)
     D_TensorInfo = TensorInfo("D", (L, M, N), type_input, layout_type)
 
-    input_tensors = [A_TensorInfo, B_TensorInfo, C_TensorInfo]
+    input_tensors = [A_TensorInfo, B_TensorInfo, bias_TensorInfo]
     output_tensors = [D_TensorInfo]
 
-    def example_epilogue(accum, C):
-        R = accum + C
+    def example_epilogue(accum, bias):
+        R = accum + bias
         D = gelu(R)
         return D
 
@@ -75,4 +75,4 @@ if __name__ == "__main__":
 
     emit_cutlass_evt_kernel(plan, kernel_name, input_tensors, output_tensors, so_name)
 
-    profile_kernel(input_tensors, output_tensors, kernel_name, so_name)
+    print(profile_kernel(input_tensors, output_tensors, kernel_name, so_name))
