@@ -160,6 +160,22 @@ class CutlassEvtEmitter:
         # field_names should be ["ptr_aux", "dAux"]
         return field_names == ["ptr_aux", "dAux"]
 
+    def is_reduce_structure(self, cls):
+        if not hasattr(cls, "_fields_"):
+            return False
+        fields = cls._fields_
+        field_names = [field[0] for field in fields]
+        return field_names == ["ptr", "reduce_identity", "dMNL"]
+
+    def emit_tensor_structure_str(self, cls, field_name):
+        o = cls({field_name: None})
+        res = [
+            f"(Element{field_name} *)ptr_{field_name}",
+            str(o.reduce_identity),
+            self.emit_tuple_type(o.dMNL),
+        ]
+        return "{" + ", ".join(res) + "}"
+    
     def emit_tuple_type(self, tuple):
         if type(tuple) == cutlass.backend.c_types.EmptyByte:
             return "{}"
@@ -234,6 +250,8 @@ class CutlassEvtEmitter:
                 )
             elif self.is_output_tensor_structure(cls):
                 return indent + self.emit_output_tensor_structure_str(cls, field_name)
+            elif self.is_reduce_structure(cls):
+                return indent + self.emit_tensor_structure_str(cls, field_name)
 
             lines.append(f"{indent}{{")
             for field_name, field_type in cls._fields_:
