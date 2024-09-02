@@ -136,7 +136,21 @@ class CutlassEvtEmitter:
         fields = cls._fields_
         field_names = [field[0] for field in fields]
         # field_names should be ["ptr_aux", "null_default", "dAux"]
-        return field_names == ["ptr_aux", "null_default", "dAux"]
+        # or ["ptr_row", "null_default", "dRow"]
+        # or ["ptr_col", "null_default", "dCol"]
+
+        return (
+            field_names == ["ptr_aux", "null_default", "dAux"]
+            or field_names == ["ptr_row", "null_default", "dRow"]
+            or field_names == ["ptr_col", "null_default", "dCol"]
+        )
+
+    def input_tensor_broadcast_type(self, cls):
+        if not hasattr(cls, "_fields_"):
+            return False
+        fields = cls._fields_
+        field_names = [field[0] for field in fields]
+        return field_names[2][1:]
 
     def is_output_tensor_structure(self, cls):
         if not hasattr(cls, "_fields_"):
@@ -147,6 +161,8 @@ class CutlassEvtEmitter:
         return field_names == ["ptr_aux", "dAux"]
 
     def emit_tuple_type(self, tuple):
+        if type(tuple) == cutlass.backend.c_types.EmptyByte:
+            return "{}"
         fields = tuple._fields_
         res = []
         for field in fields:
@@ -158,12 +174,13 @@ class CutlassEvtEmitter:
                 res.append(str(stride))
         return "{" + ", ".join(res) + "}"
 
-    def emit_input_tensor_structure_str(self, cls, field_name):
+    def emit_input_tensor_structure_str(self, cls, field_name, broadcast_type="Aux"):
         o = cls({field_name: None})
+        tuple_value = getattr(o, "d" + broadcast_type)
         res = [
             f"(Element{field_name} *)ptr_{field_name}",
             f"(Element{field_name} ){o.null_default}",
-            self.emit_tuple_type(o.dAux),
+            self.emit_tuple_type(tuple_value),
         ]
         return "{" + ", ".join(res) + "}"
 
@@ -211,7 +228,10 @@ class CutlassEvtEmitter:
             elif self.is_imm_structure(cls):
                 return indent + self.emit_imm_structure_str(cls)
             elif self.is_input_tensor_structure(cls):
-                return indent + self.emit_input_tensor_structure_str(cls, field_name)
+                broadcast_type = self.input_tensor_broadcast_type(cls)
+                return indent + self.emit_input_tensor_structure_str(
+                    cls, field_name, broadcast_type
+                )
             elif self.is_output_tensor_structure(cls):
                 return indent + self.emit_output_tensor_structure_str(cls, field_name)
 
@@ -526,6 +546,7 @@ def run_kernel(input_tensors, output_tensors, kernel_name, so_name):
         *[tensor.data_ptr() for tensor in all_torch_tensors] + [ctypes.c_void_p(0)]
     )
 
+
 def profile_kernel(input_tensors, output_tensors, kernel_name, so_name, num_iter=10):
     cutlass_lib = ctypes.CDLL("./" + so_name)
     # find func kernel_name
@@ -559,4 +580,3 @@ def profile_kernel(input_tensors, output_tensors, kernel_name, so_name, num_iter
         )
     timer.stop_and_wait()
     return timer.duration(num_iter)
-    
