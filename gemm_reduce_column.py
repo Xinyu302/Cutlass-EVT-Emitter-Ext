@@ -7,8 +7,9 @@ import cutlass
 import ctypes
 from cutlass import Tensor as FakeTensor
 from cutlass.epilogue import gelu
+from cutlass.epilogue import sum, max
 
-kernel_name = "gemm_add_fp32_bias"
+kernel_name = "gemm_reduce_column"
 so_name = kernel_name + ".so"
 
 
@@ -16,7 +17,7 @@ if __name__ == "__main__":
     # parse M, N, K, and data type
 
     parser = argparse.ArgumentParser(
-        description="Generate CUTLASS EVT kernel for GEMM with bias addition"
+        description="Generate biasUTLASS EVT kernel for GEMM with bias addition"
     )
     parser.add_argument("--L", type=int, default=1, help="Number of GEMM operations")
     parser.add_argument("--M", type=int, default=128, help="M dimension of GEMM")
@@ -42,19 +43,18 @@ if __name__ == "__main__":
     layout_type = cutlass.LayoutType.RowMajor
     A_TensorInfo = TensorInfo("A", (L, M, K), type_input, layout_type)
     B_TensorInfo = TensorInfo("B", (L, K, N), type_input, layout_type)
-    E_TensorInfo = TensorInfo("E", (L, M, N), type_accum, layout_type)
-    F_TensorInfo = TensorInfo("F", (L, M, N), type_accum, layout_type)
-    # output
+    C_TensorInfo = TensorInfo("C", (L, M, N), type_accum, layout_type)
     D_TensorInfo = TensorInfo("D", (L, M, N), type_input, layout_type)
+    F_TensorInfo = TensorInfo("F", (L, M), type_accum, layout_type)
 
+    input_tensors = [A_TensorInfo, B_TensorInfo, C_TensorInfo]
+    output_tensors = [D_TensorInfo, F_TensorInfo]
 
-    input_tensors = [A_TensorInfo, B_TensorInfo, E_TensorInfo, F_TensorInfo]
-    output_tensors = [D_TensorInfo]
-
-    def example_epilogue(accum, E, F):
-        G = E + F
-        D = accum + G
-        return D
+    def example_epilogue(accum, C):
+        H = accum + C
+        F = sum(H, dim=[2])
+        D = H
+        return D, F
 
     example_tensors = {
         "accum": FakeTensor(
