@@ -339,6 +339,9 @@ cutlass::gemm::GemmCoord problem_size(M, N, K);
         alignment_B: int = None,
         alignment_C: int = None,
     ):
+        alignment_A = get_alignment(self.shape_A[-1])
+        alignment_B = get_alignment(self.shape_B[-1])
+        alignment_C = get_alignment(self.N)
 
         self.gemm_plan.operation = self.gemm_plan.construct(
             tile_description, alignment_A, alignment_B, alignment_C
