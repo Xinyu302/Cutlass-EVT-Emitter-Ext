@@ -10,10 +10,13 @@ import tempfile
 import cutlass
 from cutlass.epilogue import relu
 from cutlass import Tensor as FakeTensor
+from cutlass_library import SwizzlingFunctor, LayoutType
 from cutlass.utils.profiler import GpuTimer
 
 from cutlass.backend import compiler
 from cutlass.backend.library import TensorDescription, TileDescription
+
+import pickle
 
 
 class TensorInfo:
@@ -77,6 +80,107 @@ def get_alignment(dim):
         return 2
     else:
         return 1
+
+
+def find_best_tile_description(
+    plan, epilogue, A_TensorInfo, B_TensorInfo, D_TensorInfo
+):
+    CACHE_FILE = "best_tile_descriptions.pkl"
+    VALID_SWIZZLES = [
+        SwizzlingFunctor.Identity1,
+        SwizzlingFunctor.Identity2,
+        SwizzlingFunctor.Identity4,
+        SwizzlingFunctor.Identity8,
+        SwizzlingFunctor.StreamK,
+    ]
+    VALID_EPILOGUE_STAGE = [1, 2]
+
+    def alloc_torch_tensor(tensor_info):
+        return torch.randn(tensor_info.shape, dtype=tensor_info.dtype, device="cuda")
+
+    shape_A = A_TensorInfo.shape
+    shape_B = B_TensorInfo.shape
+    shape_D = D_TensorInfo.shape
+    alignment_A = get_alignment(shape_A[-1])
+    alignment_B = get_alignment(shape_B[-1])
+    alignment_C = get_alignment(shape_D[-1])
+    key = (
+        shape_A,
+        shape_B,
+        shape_D,
+        A_TensorInfo.dtype,
+        B_TensorInfo.dtype,
+        D_TensorInfo.dtype,
+    )
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, "rb") as f:
+            cache = pickle.load(f)
+        if key in cache:
+            return cache[key]
+
+    best_tile_descriptions = (None, None, 1)  # td, swizzle, epilogue_stage
+    all_descriptions = plan.tile_descriptions()
+
+    # alloc torch tensor
+    tmp_A = alloc_torch_tensor(A_TensorInfo)
+    tmp_B = alloc_torch_tensor(B_TensorInfo)
+    tmp_D = alloc_torch_tensor(D_TensorInfo)
+    tmp_C = alloc_torch_tensor(D_TensorInfo)
+
+    # get the best tile description
+    # run and find the shortest time
+    best_time = float("inf")
+    for tile_description in all_descriptions:
+        for swizzle in [SwizzlingFunctor.Identity1, SwizzlingFunctor.StreamK]:
+            plan.swizzling_functor = swizzle
+            plan.compile(tile_description, alignment_A, alignment_B, alignment_C)
+            timer = GpuTimer()
+            timer.start()
+            plan.run(tmp_A, tmp_B, tmp_C, tmp_D)
+            timer.stop_and_wait()
+            if timer.duration() < best_time:
+                best_time = timer.duration()
+                best_tile_descriptions = (tile_description, swizzle, 1)
+
+    # cache the best tile description without epilogue
+    # key: shape_A, shape_B, shape_D, dtype_A, dtype_B, dtype_D
+    # value: best_tile_descriptions
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, "rb") as f:
+            cache = pickle.load(f)
+    else:
+        cache = {}
+
+    cache[key] = best_tile_descriptions
+    with open(CACHE_FILE, "wb") as f:
+        pickle.dump(cache, f)
+
+    if best_tile_descriptions[1] == SwizzlingFunctor.StreamK:
+        swizzle_list = [SwizzlingFunctor.StreamK]
+    else:
+        swizzle_list = VALID_SWIZZLES
+
+    for swizzle in swizzle_list:
+        for epilogue_stage in VALID_EPILOGUE_STAGE:
+            plan.swizzling_functor = swizzle
+            epilogue.stage = epilogue_stage
+            plan.epilogue_visitor = epilogue
+            plan.compile(
+                best_tile_descriptions[0], alignment_A, alignment_B, alignment_C
+            )
+            timer = GpuTimer()
+            timer.start()
+            plan.run(tmp_A, tmp_B, tmp_C, tmp_D)
+            timer.stop_and_wait()
+            if timer.duration() < best_time:
+                best_time = timer.duration()
+                best_tile_descriptions = (
+                    best_tile_descriptions[0],
+                    swizzle,
+                    epilogue_stage,
+                )
+
+    return best_tile_descriptions
 
 
 class CutlassEvtEmitter:
@@ -175,7 +279,7 @@ class CutlassEvtEmitter:
             self.emit_tuple_type(o.dMNL),
         ]
         return "{" + ", ".join(res) + "}"
-    
+
     def emit_tuple_type(self, tuple):
         if type(tuple) == cutlass.backend.c_types.EmptyByte:
             return "{}"
