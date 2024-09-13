@@ -475,8 +475,8 @@ cutlass::gemm::GemmCoord problem_size(M, N, K);
     def emit_cutlass_entry_function(self):
         gemm_arguments_template = """
   typename GemmOp::Arguments argument(
-      cutlass::gemm::GemmUniversalMode::kGemm,  // universal mode
-      problem_size,                                // problem_size
+      cutlass::gemm::GemmUniversalMode::kBatched,  // universal mode
+      {M, N, K},                                // problem_size
       ${L},                                        // batch count
       callback_args,                            // epilogue parameters
       ptr_A,                                    // ptr_A
@@ -596,9 +596,16 @@ class Compiler:
     def __init__(self, cutlass_code, shared_lib_name):
         self.cutlass_code = cutlass_code
         self.shared_lib_name = shared_lib_name
-        self.cmd_template = "nvcc -x cu -Xcompiler=-fpermissive -Xcompiler=-w -Xcompiler=-fPIC -std=c++17 --expt-relaxed-constexpr -Xcudafe --diag_suppress=esa_on_defaulted_function_ignored --include-path=/usr/local/cuda/include --include-path=/workspace/cutlass/python/cutlass_library/../../include --include-path=/workspace/cutlass/python/cutlass_library/../../tools/util/include --include-path=/workspace/cutlass/python/cutlass_library/../../python/cutlass/cpp/include -arch=sm_80 -shared -o ${shared_lib_name} ${cu_name} -lcudart -lcuda"
-
-        # print(self.cmd_template)
+        working_dir = os.getcwd()
+        self.cmd_template = (
+            "nvcc -x cu -Xcompiler=-fpermissive -Xcompiler=-w -Xcompiler=-fPIC -std=c++17 "
+            "--expt-relaxed-constexpr -Xcudafe --diag_suppress=esa_on_defaulted_function_ignored "
+            "--include-path=/usr/local/cuda/include "
+            f"--include-path={working_dir}/external/cutlass/include "
+            f"--include-path={working_dir}/external/cutlass/tools/util/include "
+            f"--include-path={working_dir}/external/cutlass/python/cutlass/cpp/include "
+            "-arch=sm_80 -shared -o ${shared_lib_name} ${cu_name} -lcudart -lcuda"
+        )
 
     def compile_with_nvcc(self, cmd, source, error_file):
         succeed = True
@@ -707,12 +714,17 @@ def profile_kernel(input_tensors, output_tensors, kernel_name, so_name, num_iter
             torch.randn(tensor.shape, dtype=tensor.dtype, device="cuda").uniform_(-1, 1)
         )
 
+    print("Warm up")
     # warm up
-    for _ in range(10):
-        cutlass_kernel(
-            *[tensor.data_ptr() for tensor in all_torch_tensors] + [ctypes.c_void_p(0)]
-        )
-    torch.cuda.synchronize()
+    try:
+        for _ in range(10):
+            cutlass_kernel(
+                *[tensor.data_ptr() for tensor in all_torch_tensors] + [ctypes.c_void_p(0)]
+            )
+        torch.cuda.synchronize()
+    except Exception as e:
+        print(e)
+        return -1
     # run and return the average time
     timer = GpuTimer()
     timer.start()
