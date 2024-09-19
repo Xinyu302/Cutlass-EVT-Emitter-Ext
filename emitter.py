@@ -472,7 +472,7 @@ cutlass::gemm::GemmCoord problem_size(M, N, K);
         device_gemm = f"using GemmOp = cutlass::gemm::device::GemmUniversalAdapter<{kernel_name}_type>;"
         return "\n".join([rt_module_source, device_gemm])
 
-    def emit_cutlass_entry_function(self):
+    def emit_cutlass_entry_function(self, signature="standard"):
         gemm_arguments_template = """
   typename GemmOp::Arguments argument(
       cutlass::gemm::GemmUniversalMode::kBatched,  // universal mode
@@ -495,14 +495,26 @@ cutlass::gemm::GemmCoord problem_size(M, N, K);
   );
         """
 
-        func_params = [
-            "void *" + "ptr_" + tensor.name
-            for tensor in self.input_tensor + self.output_tensor
-        ]
+        if signature == "standard":
+            func_params = [
+                "void *" + "ptr_" + tensor.name
+                for tensor in self.input_tensor + self.output_tensor
+            ] + ["cudaStream_t stream"]
+            pointer_cast = ""
 
-        func_params += [
-            "cudaStream_t stream",
-        ]
+        elif signature == "disc_runtime":
+            func_params = ["cudaStream_t stream", "void **memrefs"]
+            # memref[0] = pointer to memref type A, memref[1] = pointer to memref type B...
+            # so we need to cast the pointer to the correct type, but pointer of data in struct is at its first field
+            # then we need to cast the pointer to the first field of the struct
+            for index, tensor in enumerate(self.input_tensor + self.output_tensor):
+                pointer_cast = "int offset = 0;\n"
+                pointer_cast += (
+                    f"void *ptr_{tensor.name} = (void *)memrefs[offset];\n"
+                    f"offset += 3 + 2 * {len(tensor.shape)};\n"
+                )
+        else:
+            raise ValueError(f"Unsupported signature {signature}")
 
         EVT_D_callbacks = (
             "typename EVTD::Arguments callback_args"
@@ -564,6 +576,7 @@ cutlass::gemm::GemmCoord problem_size(M, N, K);
 
         func_template = """
 extern "C" void ${kernel_name}(${func_params}) {
+    ${pointer_cast}
     ${EVT_D_callbacks}
     ${arguemnts}
     ${op_def_and_run}
@@ -573,6 +586,7 @@ extern "C" void ${kernel_name}(${func_params}) {
             func_template,
             {
                 "kernel_name": self.kernel_name,
+                "pointer_cast": pointer_cast,
                 "func_params": ", ".join(func_params),
                 "EVT_D_callbacks": EVT_D_callbacks,
                 "arguemnts": gemm_arguments,
@@ -582,13 +596,13 @@ extern "C" void ${kernel_name}(${func_params}) {
 
         return func
 
-    def emit(self):
+    def emit(self, signature="standard"):
         code = ""
         code += self.emit_incldue()
         code += self.emit_cutlass_kernel_declaration()
         code += self.evt_problem_size()
         code += self.emit_type_and_layout()
-        code += self.emit_cutlass_entry_function()
+        code += self.emit_cutlass_entry_function(signature)
         return code
 
 
@@ -654,9 +668,10 @@ def emit_cutlass_evt_kernel(
     input_tensor: List[TensorInfo],
     output_tensor: List[TensorInfo],
     shared_lib_name: str,
+    signature="standard",
 ):
     emitter = CutlassEvtEmitter(gemm_plan, kernel_name, input_tensor, output_tensor)
-    cutlass_code = emitter.emit()
+    cutlass_code = emitter.emit(signature)
     compiler = Compiler(cutlass_code, shared_lib_name)
     compiler.compile()
 
@@ -719,7 +734,8 @@ def profile_kernel(input_tensors, output_tensors, kernel_name, so_name, num_iter
     try:
         for _ in range(10):
             cutlass_kernel(
-                *[tensor.data_ptr() for tensor in all_torch_tensors] + [ctypes.c_void_p(0)]
+                *[tensor.data_ptr() for tensor in all_torch_tensors]
+                + [ctypes.c_void_p(0)]
             )
         torch.cuda.synchronize()
     except Exception as e:
