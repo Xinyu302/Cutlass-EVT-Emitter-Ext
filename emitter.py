@@ -504,11 +504,11 @@ cutlass::gemm::GemmCoord problem_size(M, N, K);
 
         elif signature == "disc_runtime":
             func_params = ["cudaStream_t stream", "void **memrefs"]
+            pointer_cast = "int offset = 0;\n"
             # memref[0] = pointer to memref type A, memref[1] = pointer to memref type B...
             # so we need to cast the pointer to the correct type, but pointer of data in struct is at its first field
             # then we need to cast the pointer to the first field of the struct
             for index, tensor in enumerate(self.input_tensor + self.output_tensor):
-                pointer_cast = "int offset = 0;\n"
                 pointer_cast += (
                     f"void *ptr_{tensor.name} = (void *)memrefs[offset];\n"
                     f"offset += 3 + 2 * {len(tensor.shape)};\n"
